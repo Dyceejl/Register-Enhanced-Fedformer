@@ -71,13 +71,16 @@ class ThesisEvaluationFramework:
         print("Running only Scenario 1: Cross-Domain Transfer")
         print("=" * 100)
 
+        # FIX: Set save_path FIRST before any other operations
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.save_path = os.path.join(
             self.configs.save_path, f"thesis_test_{timestamp}"
         )
         os.makedirs(self.save_path, exist_ok=True)
 
-        # Only Scenario 1 for testing
+        print(f"Results will be saved to: {self.save_path}")
+
+        # Now call the evaluation
         print("\n" + "=" * 80)
         print("SCENARIO 1: CROSS-DOMAIN TRANSFER EVALUATION (SINGLE SPLIT)")
         print("=" * 80)

@@ -541,30 +541,27 @@ class MultiDomainFEDformerWithRegister(nn.Module):
         # Project register tokens to model dimension
         self.register_projection = nn.Linear(register_dim, self.d_model)
 
-        # Domain-specific embeddings (no more dynamic padding)
-        self.domain_embeddings = nn.ModuleDict()
-        self.reconstruction_heads = nn.ModuleDict()
-        self.imputation_heads = nn.ModuleDict()
+        # FIXED: Replace domain-specific embeddings with universal embedding
+        # OLD CODE (REMOVE):
+        # self.domain_embeddings = nn.ModuleDict()
+        # self.reconstruction_heads = nn.ModuleDict()
+        # self.imputation_heads = nn.ModuleDict()
+        # for domain_name, domain_config in DOMAIN_CONFIGS.items():
+        #     self.domain_embeddings[domain_name] = DomainSpecificEmbedding(...)
+        #     self.reconstruction_heads[domain_name] = nn.Linear(...)
+        #     self.imputation_heads[domain_name] = nn.Linear(...)
 
-        for domain_name, domain_config in DOMAIN_CONFIGS.items():
-            # Create domain-specific embedding
-            self.domain_embeddings[domain_name] = DomainSpecificEmbedding(
-                input_features=domain_config["features"],
-                d_model=self.d_model,
-                embed_type=configs.embed,
-                freq=domain_config["freq"],
-                dropout=configs.dropout,
-            )
+        # NEW CODE: Universal embedding and heads
+        self.universal_embedding = DynamicDataEmbedding(
+            d_model=self.d_model,
+            embed=configs.embed,
+            freq=configs.freq,
+            dropout=configs.dropout,
+        )
 
-            # Reconstruction head for ROSE's frequency learning task
-            self.reconstruction_heads[domain_name] = nn.Linear(
-                self.d_model, domain_config["features"]
-            )
-
-            # Imputation head for missing value prediction
-            self.imputation_heads[domain_name] = nn.Linear(
-                self.d_model, domain_config["features"]
-            )
+        # Universal heads that can adapt to any output dimension
+        self.universal_reconstruction_head = UniversalOutputHead(self.d_model)
+        self.universal_imputation_head = UniversalOutputHead(self.d_model)
 
         # Missing value embedding
         self.missing_embedding = nn.Parameter(torch.randn(1, 1, self.d_model) * 0.02)
@@ -657,16 +654,16 @@ class MultiDomainFEDformerWithRegister(nn.Module):
 
     def _forward_frequency_pretrain(self, x_enc, x_mark_enc, domain_name):
         """
-        ROSE's frequency reconstruction pre-training phase with error handling
+        ROSE's frequency reconstruction pre-training phase WITH register - FIXED for universal embedding
         """
-        B, L, C = x_enc.shape
+        B, L, C = x_enc.shape  # C = actual input features
         device = x_enc.device
 
         try:
             # Clean NaN values
             x_clean = torch.where(torch.isnan(x_enc), torch.zeros_like(x_enc), x_enc)
 
-            # Generate Kf frequency-masked series
+            # Generate Kf frequency-masked series (SAME)
             freq_masked_series = self.freq_learning(x_clean)  # [Kf, B, L, C]
             Kf = freq_masked_series.shape[0]
 
@@ -678,40 +675,47 @@ class MultiDomainFEDformerWithRegister(nn.Module):
                 try:
                     x_masked = freq_masked_series[k]  # [B, L, C]
 
-                    # Register processing for domain adaptation
+                    # Register processing for domain adaptation (SAME)
                     register_tokens, register_loss = self.register_system(
                         x_masked, top_k=3
                     )
                     register_tokens = self.register_projection(register_tokens)
                     register_losses.append(register_loss)
 
-                    # Domain-specific embedding
-                    if domain_name not in self.domain_embeddings:
-                        print(f"Warning: Domain {domain_name} not found, using ETTh1")
-                        domain_name = "ETTh1"
+                    # FIXED: Use universal embedding instead of domain-specific
+                    # OLD CODE (REMOVED):
+                    # if domain_name not in self.domain_embeddings:
+                    #     print(f"Warning: Domain {domain_name} not found, using ETTh1")
+                    #     domain_name = "ETTh1"
+                    # enc_out = self.domain_embeddings[domain_name](x_masked, x_mark_enc)
 
-                    enc_out = self.domain_embeddings[domain_name](x_masked, x_mark_enc)
+                    # NEW CODE: Universal embedding handles any input dimension
+                    enc_out = self.universal_embedding(x_masked, x_mark_enc)
 
-                    # Add positional encoding
+                    # Add positional encoding (SAME)
                     enc_out = enc_out + self.pos_encoding.expand(B, -1, -1)
 
-                    # Combine register tokens with sequence tokens
+                    # Combine register tokens with sequence tokens (SAME)
                     combined_tokens = torch.cat([register_tokens, enc_out], dim=1)
 
-                    # FEDformer processing
+                    # FEDformer processing (SAME)
                     encoded, _ = self.encoder(
                         combined_tokens, num_register_tokens=self.num_register_tokens
                     )
 
-                    # Extract sequence representations
+                    # Extract sequence representations (SAME)
                     sequence_encoded = encoded[:, self.num_register_tokens :, :]
 
-                    # Reconstruct original series
-                    reconstructed = self.reconstruction_heads[domain_name](
-                        sequence_encoded
+                    # FIXED: Use universal head with actual input dimension
+                    # OLD CODE (REMOVED):
+                    # reconstructed = self.reconstruction_heads[domain_name](sequence_encoded)
+
+                    # NEW CODE: Universal head adapts to input dimension C
+                    reconstructed = self.universal_reconstruction_head(
+                        sequence_encoded, C
                     )
 
-                    # Reconstruction loss
+                    # Reconstruction loss (SAME)
                     recon_loss = F.mse_loss(reconstructed, x_clean)
                     reconstruction_losses.append(recon_loss)
 
@@ -721,7 +725,7 @@ class MultiDomainFEDformerWithRegister(nn.Module):
                     reconstruction_losses.append(torch.tensor(0.0, device=device))
                     register_losses.append(torch.tensor(0.0, device=device))
 
-            # Aggregate losses
+            # Aggregate losses (SAME)
             if reconstruction_losses:
                 avg_reconstruction_loss = torch.stack(reconstruction_losses).mean()
                 avg_register_loss = torch.stack(register_losses).mean()
@@ -732,7 +736,7 @@ class MultiDomainFEDformerWithRegister(nn.Module):
             return None, None, avg_register_loss, avg_reconstruction_loss
 
         except Exception as e:
-            print(f"Error in frequency pre-training: {e}")
+            print(f"Error in register frequency pre-training: {e}")
             return (
                 None,
                 None,
@@ -903,6 +907,47 @@ class DynamicDataEmbedding(nn.Module):
         return self.dropout(x_embed)
 
 
+class UniversalOutputHead(nn.Module):
+    """Universal output head that adapts to any output dimension"""
+
+    def __init__(self, d_model):
+        super().__init__()
+        self.d_model = d_model
+        self.output_projections = nn.ModuleDict()
+
+    def get_or_create_projection(self, output_dim, device):
+        """Get or create output projection for specific dimension"""
+        key = str(output_dim)
+        if key not in self.output_projections:
+            projection = nn.Linear(self.d_model, output_dim)
+            projection = projection.to(device)
+            self.output_projections[key] = projection
+
+        # Ensure projection is on correct device
+        self.output_projections[key] = self.output_projections[key].to(device)
+        return self.output_projections[key]
+
+    def forward(self, x, output_dim):
+        """
+        Args:
+            x: [B, L, d_model] - encoded features
+            output_dim: Target output dimension
+        Returns:
+            [B, L, output_dim] - projected output
+        """
+        B, L, d_model = x.shape
+        device = x.device
+
+        projection = self.get_or_create_projection(output_dim, device)
+
+        # Reshape for projection: [B*L, d_model] -> [B*L, output_dim] -> [B, L, output_dim]
+        x_flat = x.reshape(-1, d_model)
+        output_flat = projection(x_flat)
+        output = output_flat.reshape(B, L, output_dim)
+
+        return output
+
+
 class MultiDomainFEDformerWithoutRegister(nn.Module):
     """
     Clean ablation version: Same as register version but WITHOUT register system
@@ -916,6 +961,10 @@ class MultiDomainFEDformerWithoutRegister(nn.Module):
         self.seq_len = configs.seq_len
         self.d_model = configs.d_model
 
+        self.missing_projection = nn.Linear(configs.c_in, self.d_model)
+
+        self.c_in = getattr(configs, "c_in", 7)
+
         # SAME: ROSE's frequency learning component
         self.freq_learning = DecomposedFrequencyLearning(
             Kf=getattr(configs, "Kf", 4),
@@ -926,30 +975,27 @@ class MultiDomainFEDformerWithoutRegister(nn.Module):
         # NO register_system
         # NO register_projection
 
-        # SAME: Domain-specific embeddings
-        self.domain_embeddings = nn.ModuleDict()
-        self.reconstruction_heads = nn.ModuleDict()
-        self.imputation_heads = nn.ModuleDict()
+        # FIXED: Replace domain-specific embeddings with universal embedding
+        # OLD CODE (REMOVE):
+        # self.domain_embeddings = nn.ModuleDict()
+        # self.reconstruction_heads = nn.ModuleDict()
+        # self.imputation_heads = nn.ModuleDict()
+        # for domain_name, domain_config in DOMAIN_CONFIGS.items():
+        #     self.domain_embeddings[domain_name] = DomainSpecificEmbedding(...)
+        #     self.reconstruction_heads[domain_name] = nn.Linear(...)
+        #     self.imputation_heads[domain_name] = nn.Linear(...)
 
-        for domain_name, domain_config in DOMAIN_CONFIGS.items():
-            # Create domain-specific embedding
-            self.domain_embeddings[domain_name] = DomainSpecificEmbedding(
-                input_features=domain_config["features"],
-                d_model=self.d_model,
-                embed_type=configs.embed,
-                freq=domain_config["freq"],
-                dropout=configs.dropout,
-            )
+        # NEW CODE: Universal embedding and heads
+        self.universal_embedding = DynamicDataEmbedding(
+            d_model=self.d_model,
+            embed=configs.embed,
+            freq=configs.freq,
+            dropout=configs.dropout,
+        )
 
-            # Reconstruction head for frequency learning task
-            self.reconstruction_heads[domain_name] = nn.Linear(
-                self.d_model, domain_config["features"]
-            )
-
-            # Imputation head for missing value prediction
-            self.imputation_heads[domain_name] = nn.Linear(
-                self.d_model, domain_config["features"]
-            )
+        # Universal heads that can adapt to any output dimension
+        self.universal_reconstruction_head = UniversalOutputHead(self.d_model)
+        self.universal_imputation_head = UniversalOutputHead(self.d_model)
 
         # SAME: Missing value embedding
         self.missing_embedding = nn.Parameter(torch.randn(1, 1, self.d_model) * 0.02)
@@ -1014,32 +1060,76 @@ class MultiDomainFEDformerWithoutRegister(nn.Module):
     def forward(
         self, x_enc, x_mark_enc, mask, domain_name, training_phase="imputation"
     ):
+        return self._forward_imputation(x_enc, x_mark_enc, mask, domain_name)
+
+    def _forward_imputation(self, x_enc, x_mark_enc=None, mask=None, domain_name=None):
         """
-        Forward pass for different training phases WITHOUT register system
+        Robust forward pass for imputation WITHOUT register.
+        Handles NaNs, ensures input/output feature dimensions match,
+        and works with universal embedding + universal heads.
         """
+        B, L, C = x_enc.shape
+        device = x_enc.device
+
         try:
-            if training_phase == "frequency_pretrain":
-                return self._forward_frequency_pretrain(x_enc, x_mark_enc, domain_name)
+            # 1️⃣ Replace NaNs with zeros
+            x_clean = torch.where(torch.isnan(x_enc), torch.zeros_like(x_enc), x_enc)
+
+            # 2️⃣ Universal embedding
+            enc_out = self.universal_embedding(x_clean, x_mark_enc)  # [B, L, d_model]
+
+            # 3️⃣ Handle mask
+            if mask is None:
+                mask = torch.ones_like(x_enc, dtype=torch.bool, device=device)
+            if len(mask.shape) == 4:
+                mask = mask.squeeze(-1)
+            missing_pattern = (~mask).float()  # [B, L, C]
+
+            # 4️⃣ Project missing pattern to model dimension
+            missing_embedding = self.missing_projection(
+                missing_pattern
+            )  # [B, L, d_model]
+            enc_out = enc_out + missing_embedding
+
+            # 5️⃣ Add positional encoding
+            pos_enc = self.pos_encoding[:, :L, :].expand(B, -1, -1)
+            enc_out = enc_out + pos_enc
+
+            # 6️⃣ Encoder forward
+            encoded, attns = self.encoder(
+                enc_out, num_register_tokens=0
+            )  # [B, L, d_model]
+
+            # 7️⃣ Imputation head: match input feature dimension
+            imputation_out = self.universal_imputation_head(
+                encoded, output_dim=C
+            )  # [B, L, C]
+
+            # 8️⃣ Reconstruct full series
+            reconstructed = torch.where(mask, x_clean, imputation_out)  # [B, L, C]
+
+            # 9️⃣ No register loss for this version
+            register_loss = torch.tensor(0.0, device=device)
+
+            if self.output_attention:
+                return imputation_out, reconstructed, register_loss, attns
             else:
-                return self._forward_imputation(x_enc, x_mark_enc, mask, domain_name)
+                return imputation_out, reconstructed, register_loss
+
         except Exception as e:
-            print(f"Error in no-register forward pass for {domain_name}: {e}")
-            # Return fallback values
-            B, L, C = x_enc.shape
-            device = x_enc.device
+            print(f"Error in imputation forward: {e}")
             fallback_output = torch.zeros_like(x_enc)
             fallback_loss = torch.tensor(0.0, device=device)
-
-            if training_phase == "frequency_pretrain":
-                return None, None, fallback_loss, fallback_loss
+            if self.output_attention:
+                return fallback_output, fallback_output, fallback_loss, []
             else:
                 return fallback_output, fallback_output, fallback_loss
 
     def _forward_frequency_pretrain(self, x_enc, x_mark_enc, domain_name):
         """
-        Frequency reconstruction pre-training phase WITHOUT register
+        Frequency reconstruction pre-training phase WITHOUT register - FIXED for universal embedding
         """
-        B, L, C = x_enc.shape
+        B, L, C = x_enc.shape  # C = actual input features
         device = x_enc.device
 
         try:
@@ -1060,12 +1150,15 @@ class MultiDomainFEDformerWithoutRegister(nn.Module):
                     # REMOVED: No register processing
                     # register_tokens, register_loss = self.register_system(x_masked, top_k=3)
 
-                    # Domain-specific embedding (SAME)
-                    if domain_name not in self.domain_embeddings:
-                        print(f"Warning: Domain {domain_name} not found, using ETTh1")
-                        domain_name = "ETTh1"
+                    # FIXED: Use universal embedding instead of domain-specific
+                    # OLD CODE (REMOVED):
+                    # if domain_name not in self.domain_embeddings:
+                    #     print(f"Warning: Domain {domain_name} not found, using ETTh1")
+                    #     domain_name = "ETTh1"
+                    # enc_out = self.domain_embeddings[domain_name](x_masked, x_mark_enc)
 
-                    enc_out = self.domain_embeddings[domain_name](x_masked, x_mark_enc)
+                    # NEW CODE: Universal embedding handles any input dimension
+                    enc_out = self.universal_embedding(x_masked, x_mark_enc)
 
                     # Add positional encoding (SAME)
                     enc_out = enc_out + self.pos_encoding.expand(B, -1, -1)
@@ -1084,9 +1177,13 @@ class MultiDomainFEDformerWithoutRegister(nn.Module):
                     # No need to extract sequence representations (already sequence-only)
                     sequence_encoded = encoded
 
-                    # Reconstruct original series (SAME)
-                    reconstructed = self.reconstruction_heads[domain_name](
-                        sequence_encoded
+                    # FIXED: Use universal head with actual input dimension
+                    # OLD CODE (REMOVED):
+                    # reconstructed = self.reconstruction_heads[domain_name](sequence_encoded)
+
+                    # NEW CODE: Universal head adapts to input dimension C
+                    reconstructed = self.universal_reconstruction_head(
+                        sequence_encoded, C
                     )
 
                     # Reconstruction loss (SAME)
@@ -1117,60 +1214,201 @@ class MultiDomainFEDformerWithoutRegister(nn.Module):
                 torch.tensor(0.0, device=device),
             )
 
-    def _forward_imputation(self, x_enc, x_mark_enc, mask, domain_name):
-        """
-        Imputation task forward pass WITHOUT register
-        """
+
+class ImputationOptimizedEmbedding(nn.Module):
+    """Simplified embedding optimized for imputation tasks"""
+
+    def __init__(self, input_features, d_model, embed_type, freq, dropout=0.1):
+        super().__init__()
+        self.input_features = input_features
+        self.d_model = d_model
+
+        # FIXED: Use linear projection instead of circular conv
+        self.value_projection = nn.Linear(input_features, d_model)
+
+        # Temporal embedding
+        if embed_type == "timeF":
+            self.temporal_embedding = nn.Linear(4, d_model)  # 4 time features
+        else:
+            self.temporal_embedding = nn.Embedding(366, d_model)
+
+        self.dropout = nn.Dropout(dropout)
+        self.embed_type = embed_type
+
+    def forward(self, x, x_mark):
+        B, L = x.shape[:2]
+
+        # Simple linear projection for values
+        x_embed = self.value_projection(x)
+
+        # Temporal embedding
+        if x_mark is not None and self.embed_type == "timeF":
+            temporal_embed = self.temporal_embedding(x_mark)
+        elif x_mark is not None:
+            positions = torch.arange(L, device=x.device).unsqueeze(0).expand(B, -1)
+            temporal_embed = self.temporal_embedding(positions % 366)
+        else:
+            temporal_embed = torch.zeros_like(x_embed)
+
+        return self.dropout(x_embed + temporal_embed)
+
+
+class SimpleImputationEncoderLayer(nn.Module):
+    """Simplified encoder layer without bidirectional processing"""
+
+    def __init__(self, attention, d_model, d_ff=None, dropout=0.1, activation="relu"):
+        super().__init__()
+        d_ff = d_ff or 4 * d_model
+
+        self.attention = attention
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        # Simple feedforward network
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.ReLU() if activation == "relu" else nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x, attn_mask=None, num_register_tokens=0):
+        # Self-attention with residual connection
+        attn_out, attn_weights = self.attention(x, x, x, attn_mask=attn_mask)
+        x = self.norm1(x + attn_out)
+
+        # Feedforward with residual connection
+        ffn_out = self.ffn(x)
+        x = self.norm2(x + ffn_out)
+
+        return x, attn_weights
+
+
+class ImputationOptimizedFEDformer(nn.Module):
+    """
+    Simplified FEDformer optimized specifically for imputation tasks
+    """
+
+    def __init__(self, configs):
+        super().__init__()
+        self.configs = configs
+        self.output_attention = getattr(configs, "output_attention", False)
+        self.seq_len = configs.seq_len
+        self.d_model = configs.d_model
+
+        # Domain-specific embeddings (using simplified embedding)
+        self.domain_embeddings = nn.ModuleDict()
+        self.imputation_heads = nn.ModuleDict()
+
+        from multi_domain_fedformer import DOMAIN_CONFIGS
+
+        for domain_name, domain_config in DOMAIN_CONFIGS.items():
+            # Simplified domain-specific embedding
+            self.domain_embeddings[domain_name] = ImputationOptimizedEmbedding(
+                input_features=domain_config["features"],
+                d_model=self.d_model,
+                embed_type=configs.embed,
+                freq=domain_config["freq"],
+                dropout=configs.dropout,
+            )
+
+            # Imputation head
+            self.imputation_heads[domain_name] = nn.Sequential(
+                nn.Linear(self.d_model, self.d_model // 2),
+                nn.ReLU(),
+                nn.Dropout(configs.dropout),
+                nn.Linear(self.d_model // 2, domain_config["features"]),
+            )
+
+        # Learnable positional encoding
+        self.pos_encoding = nn.Parameter(
+            torch.randn(1, configs.seq_len, self.d_model) * 0.02
+        )
+
+        # Simplified encoder
+        from layers.AutoCorrelation import AutoCorrelation, AutoCorrelationLayer
+
+        encoder_self_att = AutoCorrelation(
+            mask_flag=False,
+            factor=configs.factor if hasattr(configs, "factor") else 1,
+            attention_dropout=configs.dropout,
+        )
+
+        self.encoder_layers = nn.ModuleList(
+            [
+                SimpleImputationEncoderLayer(
+                    AutoCorrelationLayer(
+                        encoder_self_att, self.d_model, getattr(configs, "n_heads", 8)
+                    ),
+                    self.d_model,
+                    configs.d_ff,
+                    dropout=configs.dropout,
+                    activation=configs.activation,
+                )
+                for _ in range(configs.e_layers)
+            ]
+        )
+
+        self.final_norm = nn.LayerNorm(self.d_model)
+
+        # Initialize weights
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Conservative weight initialization"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward(
+        self, x_enc, x_mark_enc, mask, domain_name, training_phase="imputation"
+    ):
+        """Simplified forward pass focused on imputation"""
         B, L, C = x_enc.shape
         device = x_enc.device
 
         try:
-            # Clean NaN values
+            # Handle NaN values
             x_clean = torch.where(torch.isnan(x_enc), torch.zeros_like(x_enc), x_enc)
 
-            # REMOVED: No register processing
-            # register_tokens, register_loss = self.register_system(x_clean, top_k=3)
-
-            # Domain-specific embedding (SAME)
+            # Domain-specific embedding
             if domain_name not in self.domain_embeddings:
-                print(f"Warning: Domain {domain_name} not found, using ETTh1")
                 domain_name = "ETTh1"
 
             enc_out = self.domain_embeddings[domain_name](x_clean, x_mark_enc)
 
-            # Add missing value embeddings (SAME)
-            if len(mask.shape) == 4:
-                mask = mask.squeeze(-1)
+            # Add positional encoding (handle length mismatch)
+            if L <= self.seq_len:
+                pos_enc = self.pos_encoding[:, :L, :].expand(B, -1, -1)
+            else:
+                # Repeat positional encoding for longer sequences
+                pos_enc = self.pos_encoding.repeat(1, (L // self.seq_len) + 1, 1)[
+                    :, :L, :
+                ].expand(B, -1, -1)
 
-            missing_indicator = (~mask).float().mean(dim=-1, keepdim=True)  # [B, L, 1]
-            missing_mask_expanded = missing_indicator.expand(-1, -1, self.d_model)
-            missing_emb = self.missing_embedding.expand(B, L, -1)
-            enc_out = enc_out + missing_mask_expanded * missing_emb
+            enc_out = enc_out + pos_enc
 
-            # Add positional encoding (SAME)
-            enc_out = enc_out + self.pos_encoding.expand(B, -1, -1)
+            # Encoder processing
+            attns = []
+            for layer in self.encoder_layers:
+                enc_out, attn = layer(enc_out, attn_mask=None, num_register_tokens=0)
+                attns.append(attn)
 
-            # CHANGED: No register tokens to combine
-            # combined_tokens = torch.cat([register_tokens, enc_out], dim=1)
-            # Just use sequence tokens directly
-            sequence_tokens = enc_out
+            enc_out = self.final_norm(enc_out)
 
-            # FEDformer processing WITHOUT register tokens
-            encoded, attns = self.encoder(
-                sequence_tokens,
-                num_register_tokens=0,  # No register tokens
-            )
+            # Imputation prediction
+            imputation_out = self.imputation_heads[domain_name](enc_out)
 
-            # No need to extract sequence representations (already sequence-only)
-            sequence_encoded = encoded
-
-            # Imputation prediction (SAME)
-            imputation_out = self.imputation_heads[domain_name](sequence_encoded)
-
-            # Reconstruct full series (SAME)
+            # Reconstruct: use observed values where available
             reconstructed = torch.where(mask, x_clean, imputation_out)
 
-            # CHANGED: No register loss
+            # No register loss for this simplified version
             register_loss = torch.tensor(0.0, device=device)
 
             if self.output_attention:
@@ -1179,12 +1417,11 @@ class MultiDomainFEDformerWithoutRegister(nn.Module):
                 return imputation_out, reconstructed, register_loss
 
         except Exception as e:
-            print(f"Error in no-register imputation forward: {e}")
-            # Return fallback values
-            fallback_output = torch.zeros_like(x_enc)
+            print(f"Error in simplified forward pass: {e}")
+            fallback = torch.zeros_like(x_enc)
             fallback_loss = torch.tensor(0.0, device=device)
 
             if self.output_attention:
-                return fallback_output, fallback_output, fallback_loss, []
+                return fallback, fallback, fallback_loss, []
             else:
-                return fallback_output, fallback_output, fallback_loss
+                return fallback, fallback, fallback_loss

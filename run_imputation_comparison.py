@@ -24,11 +24,13 @@ from Register_Analysis import analyze_register_system
 from configs.imputation_config import ImputationConfig, LightImputationConfig
 from imputation_trainer import (
     ImputationDataset,
+    ImputationFocusedTrainer,
     ROSEStyleTrainer,
     create_domain_datasets,
     train_approach_2,  # This calls train_approach_no_register
 )
 from multi_domain_fedformer import (
+    ImputationOptimizedFEDformer,
     MultiDomainFEDformerWithoutRegister,
     MultiDomainFEDformerWithRegister,
 )
@@ -2092,11 +2094,399 @@ def run_complete_debugging_suite(base_config):
     }
 
 
+def train_competitive_fedformer(configs):
+    """
+    Train FedFormer with all fixes applied for competitive performance - FIXED VERSION
+    """
+    print("\n" + "=" * 80)
+    print("TRAINING COMPETITIVE FEDFORMER (ALL FIXES APPLIED)")
+    print("=" * 80)
+
+    # Create datasets with normalization
+    train_datasets, test_datasets = create_domain_datasets(configs)
+
+    print(f"Training on {len(train_datasets)} domains with normalization")
+
+    # CRITICAL FIX: Create shared scalers for each domain to avoid recomputation
+    print("Setting up shared normalization scalers...")
+    domain_scalers = {}
+
+    for domain_name, train_dataset in train_datasets.items():
+        print(f"  Creating scaler for {domain_name}...")
+        try:
+            # Create one ImputationDataset to compute scaler
+            temp_dataset = ImputationDataset(train_dataset, missing_rate=0.2)
+            domain_scalers[domain_name] = temp_dataset.scaler
+            print(f"    ✓ Scaler created for {domain_name}")
+        except Exception as e:
+            print(f"    ✗ Error creating scaler for {domain_name}: {e}")
+            # Create identity scaler as fallback
+            from sklearn.preprocessing import StandardScaler
+
+            fallback_scaler = StandardScaler()
+            dummy_data = np.zeros((10, 7))  # Assume 7 features as fallback
+            fallback_scaler.fit(dummy_data)
+            fallback_scaler.mean_ = np.zeros_like(fallback_scaler.mean_)
+            fallback_scaler.scale_ = np.ones_like(fallback_scaler.scale_)
+            domain_scalers[domain_name] = fallback_scaler
+
+    # Use the optimized architecture
+    try:
+        model = ImputationOptimizedFEDformer(configs)
+        print(f"Using ImputationOptimizedFEDformer architecture")
+    except Exception as e:
+        print(f"ImputationOptimizedFEDformer failed: {e}")
+        print("Falling back to MultiDomainFEDformerWithoutRegister")
+        from multi_domain_fedformer import MultiDomainFEDformerWithoutRegister
+
+        model = MultiDomainFEDformerWithoutRegister(configs)
+
+    # Use the focused trainer
+    try:
+        trainer = ImputationFocusedTrainer(model, configs)
+        print(f"Using ImputationFocusedTrainer (direct imputation training)")
+    except Exception as e:
+        print(f"ImputationFocusedTrainer creation failed: {e}")
+        return None, [], {}
+
+    # Training loop
+    best_loss = float("inf")
+    train_losses = []
+
+    print(f"\nTraining for {configs.train_epochs} epochs (imputation only):")
+
+    for epoch in range(configs.train_epochs):
+        epoch_start_time = time.time()
+
+        print(f"\nEpoch {epoch + 1:2d}:")
+
+        # CRITICAL FIX: Create datasets with shared scalers for this epoch
+        epoch_train_datasets = {}
+        for domain_name, train_dataset in train_datasets.items():
+            try:
+                epoch_train_datasets[domain_name] = ImputationDataset(
+                    train_dataset,
+                    missing_rate=configs.missing_rate,
+                    shared_scaler=domain_scalers[domain_name],  # Use shared scaler
+                )
+            except Exception as e:
+                print(f"  Error creating epoch dataset for {domain_name}: {e}")
+                continue
+
+        if not epoch_train_datasets:
+            print("  No valid datasets for this epoch, skipping...")
+            train_losses.append(float("inf"))
+            continue
+
+        # Train epoch - direct imputation training
+        try:
+            epoch_loss = trainer.train_epoch_imputation_only(epoch_train_datasets)
+        except Exception as e:
+            print(f"  Training failed: {e}")
+            import traceback
+
+            traceback.print_exc()
+            epoch_loss = float("inf")
+
+        train_losses.append(epoch_loss)
+        epoch_time = time.time() - epoch_start_time
+
+        print(f"  Loss={epoch_loss:.6f}, Time={epoch_time:.1f}s")
+
+        # Check for valid loss
+        if (
+            not (np.isnan(epoch_loss) or np.isinf(epoch_loss))
+            and epoch_loss < best_loss
+        ):
+            best_loss = epoch_loss
+            # Save best model
+            try:
+                os.makedirs(configs.save_path, exist_ok=True)
+                torch.save(
+                    model.state_dict(),
+                    os.path.join(configs.save_path, "competitive_fedformer_best.pth"),
+                )
+                print(f"    → New best model saved! (Loss: {best_loss:.6f})")
+            except Exception as e:
+                print(f"    Warning: Could not save model: {e}")
+
+        # Early stopping for diverged training
+        if epoch > 2 and (np.isinf(epoch_loss) or epoch_loss > best_loss * 3.0):
+            print(
+                f"  Early stopping at epoch {epoch + 1} (loss diverging: {epoch_loss:.6f})"
+            )
+            break
+
+    # Evaluation with shared scalers
+    print(f"\nEvaluating competitive FedFormer...")
+
+    try:
+        # Create test datasets with shared scalers
+        epoch_test_datasets = {}
+        for domain_name, test_dataset in test_datasets.items():
+            try:
+                epoch_test_datasets[domain_name] = ImputationDataset(
+                    test_dataset,
+                    missing_rate=configs.test_missing_rate,
+                    shared_scaler=domain_scalers[
+                        domain_name
+                    ],  # Use same scaler as training
+                )
+            except Exception as e:
+                print(f"  Error creating test dataset for {domain_name}: {e}")
+                continue
+
+        if epoch_test_datasets:
+            test_results = trainer.evaluate_domain_separate(epoch_test_datasets)
+        else:
+            print("  No valid test datasets, evaluation failed")
+            test_results = {}
+
+    except Exception as e:
+        print(f"  Evaluation failed: {e}")
+        import traceback
+
+        traceback.print_exc()
+        test_results = {}
+
+    # Print results
+    print(f"\nCompetitive FedFormer Results:")
+    print(f"{'Domain':<12} {'MSE':<12} {'MAE':<12}")
+    print("-" * 40)
+
+    total_mse, total_mae = 0, 0
+    valid_domains = 0
+
+    for domain_name in train_datasets.keys():
+        if domain_name in test_results:
+            mse, mae = test_results[domain_name]
+            if mse != float("inf"):
+                print(f"{domain_name:<12} {mse:<12.6f} {mae:<12.6f}")
+                total_mse += mse
+                total_mae += mae
+                valid_domains += 1
+            else:
+                print(f"{domain_name:<12} {'Failed':<12} {'Failed':<12}")
+        else:
+            print(f"{domain_name:<12} {'Missing':<12} {'Missing':<12}")
+
+    if valid_domains > 0:
+        avg_mse = total_mse / valid_domains
+        avg_mae = total_mae / valid_domains
+        print("-" * 40)
+        print(f"{'AVERAGE':<12} {avg_mse:<12.6f} {avg_mae:<12.6f}")
+
+    print(f"\nBest training loss: {best_loss:.6f}")
+    print("=" * 80)
+
+    return model, train_losses, test_results
+
+
+def run_fixed_comparison():
+    """
+    COMPLETE FIXED comparison: FedFormer vs BRITS vs SAITS
+    Trains baselines domain-by-domain to handle mixed dimensions
+    """
+    print("=" * 100)
+    print("COMPLETE FIXED COMPARISON: FedFormer vs BRITS vs SAITS")
+    print("=" * 100)
+
+    from configs.imputation_config import LightImputationConfig
+
+    configs = LightImputationConfig()
+
+    print(f"✓ Using {configs.__class__.__name__}: {configs.train_epochs} epochs")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    configs.save_path = os.path.join(configs.save_path, f"complete_fixed_{timestamp}")
+
+    # Get datasets once
+    train_datasets, test_datasets = create_domain_datasets(configs)
+    print(f"✓ Datasets loaded: {list(train_datasets.keys())}")
+
+    # 1. Train FedFormer (multi-domain)
+    print("\n" + "=" * 60)
+    print("1. TRAINING FEDFORMER (Multi-Domain)")
+    print("=" * 60)
+
+    try:
+        model_fixed, losses_fixed, results_fixed = train_competitive_fedformer(configs)
+        print("✅ FedFormer training completed!")
+
+        # Show FedFormer results
+        print("FedFormer Results:")
+        for domain, (mse, mae) in results_fixed.items():
+            if mse != float("inf"):
+                print(f"  {domain:12s}: MSE={mse:.6f}, MAE={mae:.6f}")
+            else:
+                print(f"  {domain:12s}: Failed")
+
+    except Exception as e:
+        print(f"❌ FedFormer training failed: {e}")
+        results_fixed = {
+            domain: (float("inf"), float("inf")) for domain in train_datasets.keys()
+        }
+
+    # 2. Train BRITS (domain-by-domain)
+    print("\n" + "=" * 60)
+    print("2. TRAINING BRITS (Domain-by-Domain)")
+    print("=" * 60)
+
+    brits_results = {}
+
+    for domain_name, train_dataset in train_datasets.items():
+        print(f"Training BRITS for {domain_name}...")
+
+        try:
+            from baseline_models import BRITSWrapper
+
+            # Single-domain training
+            single_domain_train = {domain_name: train_dataset}
+
+            domain_configs = copy.deepcopy(configs)
+            brits_model = BRITSWrapper(domain_configs)
+            brits_model.fit(single_domain_train)
+
+            # Evaluate
+            mse, mae = brits_model.evaluate_domain(
+                domain_name, test_datasets[domain_name]
+            )
+            brits_results[domain_name] = (mse, mae)
+
+            print(f"  ✅ {domain_name:12s}: MSE={mse:.6f}, MAE={mae:.6f}")
+
+        except Exception as e:
+            print(f"  ❌ {domain_name:12s}: {e}")
+            brits_results[domain_name] = (float("inf"), float("inf"))
+
+    print("BRITS training completed!")
+
+    # 3. Train SAITS (domain-by-domain)
+    print("\n" + "=" * 60)
+    print("3. TRAINING SAITS (Domain-by-Domain)")
+    print("=" * 60)
+
+    saits_results = {}
+
+    for domain_name, train_dataset in train_datasets.items():
+        print(f"Training SAITS for {domain_name}...")
+
+        try:
+            from baseline_models import SAITSWrapper
+
+            # Single-domain training
+            single_domain_train = {domain_name: train_dataset}
+
+            domain_configs = copy.deepcopy(configs)
+            saits_model = SAITSWrapper(domain_configs)
+            saits_model.fit(single_domain_train)
+
+            # Evaluate
+            mse, mae = saits_model.evaluate_domain(
+                domain_name, test_datasets[domain_name]
+            )
+            saits_results[domain_name] = (mse, mae)
+
+            print(f"  ✅ {domain_name:12s}: MSE={mse:.6f}, MAE={mae:.6f}")
+
+        except Exception as e:
+            print(f"  ❌ {domain_name:12s}: {e}")
+            saits_results[domain_name] = (float("inf"), float("inf"))
+
+    print("SAITS training completed!")
+
+    # 4. COMPREHENSIVE COMPARISON
+    print("\n" + "=" * 120)
+    print("🏆 COMPREHENSIVE COMPARISON RESULTS")
+    print("=" * 120)
+
+    print(
+        f"{'Domain':<15} {'FedFormer':<20} {'BRITS':<20} {'SAITS':<20} {'Winner':<15}"
+    )
+    print(
+        f"{'':15} {'MSE':<9} {'MAE':<9} {'MSE':<9} {'MAE':<9} {'MSE':<9} {'MAE':<9} {'Model':<15}"
+    )
+    print("-" * 120)
+
+    fedformer_wins = 0
+    brits_wins = 0
+    saits_wins = 0
+    total_domains = 0
+
+    for domain in sorted(train_datasets.keys()):
+        fed_mse, fed_mae = results_fixed.get(domain, (float("inf"), float("inf")))
+        brits_mse, brits_mae = brits_results.get(domain, (float("inf"), float("inf")))
+        saits_mse, saits_mae = saits_results.get(domain, (float("inf"), float("inf")))
+
+        # Check if all models have valid results
+        valid_results = [
+            ("FedFormer", fed_mse),
+            ("BRITS", brits_mse),
+            ("SAITS", saits_mse),
+        ]
+        valid_results = [
+            (name, mse) for name, mse in valid_results if mse != float("inf")
+        ]
+
+        if len(valid_results) >= 2:  # Need at least 2 valid results for comparison
+            winner_name, winner_mse = min(valid_results, key=lambda x: x[1])
+
+            if winner_name == "FedFormer":
+                fedformer_wins += 1
+            elif winner_name == "BRITS":
+                brits_wins += 1
+            else:
+                saits_wins += 1
+            total_domains += 1
+
+            print(
+                f"{domain:<15} {fed_mse:<9.6f} {fed_mae:<9.6f} "
+                f"{brits_mse:<9.6f} {brits_mae:<9.6f} "
+                f"{saits_mse:<9.6f} {saits_mae:<9.6f} {winner_name:<15}"
+            )
+        else:
+            print(
+                f"{domain:<15} {'N/A':<9} {'N/A':<9} {'N/A':<9} {'N/A':<9} {'N/A':<9} {'N/A':<9} {'Insufficient':<15}"
+            )
+
+    print("-" * 120)
+    print("🏆 FINAL RESULTS:")
+    if total_domains > 0:
+        print(
+            f"  FedFormer wins: {fedformer_wins}/{total_domains} domains ({fedformer_wins / total_domains * 100:.1f}%)"
+        )
+        print(
+            f"  BRITS wins: {brits_wins}/{total_domains} domains ({brits_wins / total_domains * 100:.1f}%)"
+        )
+        print(
+            f"  SAITS wins: {saits_wins}/{total_domains} domains ({saits_wins / total_domains * 100:.1f}%)"
+        )
+
+        if fedformer_wins >= total_domains // 2:
+            print("\n🎉 SUCCESS: FedFormer outperforms baselines!")
+        elif fedformer_wins >= total_domains // 3:
+            print("\n📈 PROGRESS: FedFormer is competitive with baselines!")
+        else:
+            print("\n⚠️ PARTIAL: FedFormer shows improvement but needs optimization")
+    else:
+        print("❌ No valid comparisons possible")
+
+    print("=" * 120)
+
+    return results_fixed, brits_results, saits_results
+
+
 # Update your main function
 def main():
     parser = argparse.ArgumentParser(
         description="Enhanced Multi-domain FEDformer Imputation"
     )
+    parser.add_argument(
+        "--fixed-comparison",
+        action="store_true",
+        help="Run comparison with all fixes applied",
+    )
+
     parser.add_argument(
         "--approach", type=int, choices=[1, 2, 3], help="Approach to run"
     )
@@ -2172,6 +2562,11 @@ def main():
         framework = ThesisEvaluationFramework(configs)
         results = framework.run_complete_evaluation()
         print("Thesis evaluation test completed!")
+
+    elif args.fixed_comparison:
+        print("Running fixed FedFormer comparison...")
+        results = run_fixed_comparison()
+        print("Fixed comparison completed!")
 
     elif args.data_scarcity:
         print("Starting Data Scarcity Experiment (Approach 1)...")

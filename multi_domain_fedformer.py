@@ -17,27 +17,89 @@ from configs import imputation_config
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+def linear_interpolate_missing(x):
+    """Linear interpolation for missing values before FFT"""
+    B, L, C = x.shape
+    device = x.device
+    x_filled = x.clone()
+    
+    for b in range(B):
+        for c in range(C):
+            series = x[b, :, c]
+            
+            if not torch.isnan(series).any():
+                continue
+            
+            if torch.isnan(series).all():
+                x_filled[b, :, c] = 0.0
+                continue
+            
+            observed_mask = ~torch.isnan(series)
+            observed_idx = torch.where(observed_mask)[0]
+            observed_val = series[observed_mask]
+            
+            all_idx = torch.arange(L, dtype=torch.float32, device=device)
+            
+            if device.type == 'cpu':
+                import numpy as np
+                filled = np.interp(
+                    all_idx.cpu().numpy(),
+                    observed_idx.cpu().numpy(),
+                    observed_val.cpu().numpy()
+                )
+                x_filled[b, :, c] = torch.from_numpy(filled).to(device)
+            else:
+                filled = series.clone()
+                last_val = None
+                for i in range(L):
+                    if observed_mask[i]:
+                        last_val = filled[i]
+                    elif last_val is not None:
+                        filled[i] = last_val
+                
+                last_val = None
+                for i in range(L-1, -1, -1):
+                    if observed_mask[i]:
+                        last_val = filled[i]
+                    elif last_val is not None and torch.isnan(filled[i]):
+                        filled[i] = last_val
+                
+                x_filled[b, :, c] = filled
+    
+    return x_filled
 
 class DecomposedFrequencyLearning(nn.Module):
     """ROSE's Decomposed Frequency Learning for representation learning"""
 
-    def __init__(self, Kf=4, max_freq_ratio=0.2):
+    def __init__(self, Kf=4, max_freq_ratio=0.2, use_interpolation=True):
         super().__init__()
         self.Kf = Kf  # Number of frequency masks
         self.max_freq_ratio = max_freq_ratio  # Upper bound for frequency masking
+        self.use_interpolation = use_interpolation
 
     def multi_frequency_mask(self, x):
         """
-        Apply multi-frequency masking following ROSE paper
+        Apply multi-frequency masking with proper NaN handling
         Args:
-            x: [B, L, C] - Input time series (native domain dimensions)
+            x: [B, L, C] - Input time series (may contain NaN)
         Returns:
             masked_series: [Kf, B, L, C] - Kf frequency-masked versions
         """
         B, L, C = x.shape
 
-        # Transform to frequency domain
-        x_freq = torch.fft.rfft(x, dim=1)  # [B, L//2+1, C]
+        # STEP 1: Clean NaN using interpolation or zero-fill
+        if self.use_interpolation:
+            x_clean = linear_interpolate_missing(x)
+        else:
+            x_clean = torch.where(torch.isnan(x), torch.zeros_like(x), x)
+
+        # STEP 2: Double-check no NaN remains
+        if torch.isnan(x_clean).any():
+            print(f"      Warning: NaN still present after cleaning, replacing with zeros")
+            x_clean = torch.where(torch.isnan(x_clean), torch.zeros_like(x_clean), x_clean)
+
+        # STEP 3: Transform to frequency domain
+        x_freq = torch.fft.rfft(x_clean, dim=1)  # [B, L//2+1, C]
         freq_len = x_freq.shape[1]
 
         masked_series = []
@@ -59,6 +121,13 @@ class DecomposedFrequencyLearning(nn.Module):
             # Apply mask and transform back (ROSE Equation 3)
             x_freq_masked = x_freq * mask
             x_masked = torch.fft.irfft(x_freq_masked, n=L, dim=1)
+
+            # STEP 4: Check for NaN after inverse FFT (shouldn't happen, but be safe)
+            if torch.isnan(x_masked).any():
+                # This can happen if the frequency masking was too aggressive
+                # Replace NaN with the original clean values at those positions
+                x_masked = torch.where(torch.isnan(x_masked), x_clean, x_masked)
+
             masked_series.append(x_masked)
 
         return torch.stack(masked_series, dim=0)  # [Kf, B, L, C]
@@ -961,14 +1030,21 @@ class MultiDomainFEDformerWithoutRegister(nn.Module):
         self.seq_len = configs.seq_len
         self.d_model = configs.d_model
 
-        self.missing_projection = nn.Linear(configs.c_in, self.d_model)
+        # self.missing_projection = nn.Linear(configs.c_in, self.d_model)
+        # self.c_in = getattr(configs, "c_in", 7)
 
-        self.c_in = getattr(configs, "c_in", 7)
-
+        self.missing_projections = nn.ModuleDict()
+        
         # SAME: ROSE's frequency learning component
         self.freq_learning = DecomposedFrequencyLearning(
             Kf=getattr(configs, "Kf", 4),
             max_freq_ratio=getattr(configs, "max_freq_ratio", 0.2),
+        )
+        
+        self.freq_learning = DecomposedFrequencyLearning(
+            Kf=getattr(configs, 'Kf', 4),
+            max_freq_ratio=getattr(configs, 'max_freq_ratio', 0.2),
+            use_interpolation=getattr(configs, 'use_fft_interpolation', True)  # NEW
         )
 
         # REMOVED: Register system completely
@@ -1057,10 +1133,14 @@ class MultiDomainFEDformerWithoutRegister(nn.Module):
 
         print("No-Register Model weights initialized")
 
-    def forward(
-        self, x_enc, x_mark_enc, mask, domain_name, training_phase="imputation"
-    ):
-        return self._forward_imputation(x_enc, x_mark_enc, mask, domain_name)
+    def forward(self, x_enc, x_mark_enc, mask, domain_name, training_phase="imputation"):
+        """
+        Forward pass routing based on training phase
+        """
+        if training_phase == "frequency_pretrain":
+            return self._forward_frequency_pretrain(x_enc, x_mark_enc, domain_name)
+        else:
+            return self._forward_imputation(x_enc, x_mark_enc, mask, domain_name)
 
     def _forward_imputation(self, x_enc, x_mark_enc=None, mask=None, domain_name=None):
         """
@@ -1086,9 +1166,11 @@ class MultiDomainFEDformerWithoutRegister(nn.Module):
             missing_pattern = (~mask).float()  # [B, L, C]
 
             # 4️⃣ Project missing pattern to model dimension
-            missing_embedding = self.missing_projection(
-                missing_pattern
-            )  # [B, L, d_model]
+            if domain_name not in self.missing_projections:
+                self.missing_projections[domain_name] = nn.Linear(C, self.d_model).to(device)
+                print(f"    Created missing projection for {domain_name}: {C} -> {self.d_model}")
+            
+            missing_embedding = self.missing_projections[domain_name](missing_pattern)  # [B, L, d_model]
             enc_out = enc_out + missing_embedding
 
             # 5️⃣ Add positional encoding
@@ -1127,86 +1209,111 @@ class MultiDomainFEDformerWithoutRegister(nn.Module):
 
     def _forward_frequency_pretrain(self, x_enc, x_mark_enc, domain_name):
         """
-        Frequency reconstruction pre-training phase WITHOUT register - FIXED for universal embedding
+        Frequency reconstruction pre-training phase WITHOUT register - FIXED for NaN handling
         """
-        B, L, C = x_enc.shape  # C = actual input features
+        B, L, C = x_enc.shape
         device = x_enc.device
 
         try:
-            # Clean NaN values
-            x_clean = torch.where(torch.isnan(x_enc), torch.zeros_like(x_enc), x_enc)
-
-            # Generate Kf frequency-masked series (SAME as register version)
-            freq_masked_series = self.freq_learning(x_clean)  # [Kf, B, L, C]
+            # Step 1: Apply frequency learning (handles NaN internally via interpolation)
+            freq_masked_series = self.freq_learning(x_enc)  # [Kf, B, L, C]
             Kf = freq_masked_series.shape[0]
 
             reconstruction_losses = []
+
+            # Step 2: Get the clean target (for computing loss)
+            # The freq_learning already did interpolation, so we need the clean version
+            if self.freq_learning.use_interpolation:
+                x_clean = linear_interpolate_missing(x_enc)
+            else:
+                x_clean = torch.where(torch.isnan(x_enc), torch.zeros_like(x_enc), x_enc)
 
             # Process each frequency-masked series
             for k in range(Kf):
                 try:
                     x_masked = freq_masked_series[k]  # [B, L, C]
 
-                    # REMOVED: No register processing
-                    # register_tokens, register_loss = self.register_system(x_masked, top_k=3)
+                    # Check for NaN in masked series
+                    if torch.isnan(x_masked).any():
+                        x_masked = torch.where(torch.isnan(x_masked), torch.zeros_like(x_masked), x_masked)
 
-                    # FIXED: Use universal embedding instead of domain-specific
-                    # OLD CODE (REMOVED):
-                    # if domain_name not in self.domain_embeddings:
-                    #     print(f"Warning: Domain {domain_name} not found, using ETTh1")
-                    #     domain_name = "ETTh1"
-                    # enc_out = self.domain_embeddings[domain_name](x_masked, x_mark_enc)
-
-                    # NEW CODE: Universal embedding handles any input dimension
+                    # Use universal embedding
                     enc_out = self.universal_embedding(x_masked, x_mark_enc)
 
-                    # Add positional encoding (SAME)
-                    enc_out = enc_out + self.pos_encoding.expand(B, -1, -1)
+                    # Check for NaN after embedding
+                    if torch.isnan(enc_out).any():
+                        print(f"      Warning: NaN after embedding in mask {k}")
+                        reconstruction_losses.append(torch.tensor(0.0, device=device))
+                        continue
 
-                    # CHANGED: No register tokens to combine
-                    # combined_tokens = torch.cat([register_tokens, enc_out], dim=1)
-                    # Just use sequence tokens directly
-                    sequence_tokens = enc_out
+                    # Add positional encoding
+                    pos_enc = self.pos_encoding[:, :L, :].expand(B, -1, -1)
+                    enc_out = enc_out + pos_enc
 
-                    # FEDformer processing WITHOUT register tokens
-                    encoded, _ = self.encoder(
-                        sequence_tokens,
-                        num_register_tokens=0,  # No register tokens
-                    )
+                    # Encoder processing (no register tokens)
+                    encoded, _ = self.encoder(enc_out, num_register_tokens=0)
 
-                    # No need to extract sequence representations (already sequence-only)
-                    sequence_encoded = encoded
+                    # Check for NaN after encoder
+                    if torch.isnan(encoded).any():
+                        print(f"      Warning: NaN after encoder in mask {k}")
+                        reconstruction_losses.append(torch.tensor(0.0, device=device))
+                        continue
 
-                    # FIXED: Use universal head with actual input dimension
-                    # OLD CODE (REMOVED):
-                    # reconstructed = self.reconstruction_heads[domain_name](sequence_encoded)
+                    # Reconstruction head
+                    reconstructed = self.universal_reconstruction_head(encoded, C)
 
-                    # NEW CODE: Universal head adapts to input dimension C
-                    reconstructed = self.universal_reconstruction_head(
-                        sequence_encoded, C
-                    )
+                    # Check for NaN after reconstruction
+                    if torch.isnan(reconstructed).any():
+                        print(f"      Warning: NaN after reconstruction head in mask {k}")
+                        reconstruction_losses.append(torch.tensor(0.0, device=device))
+                        continue
 
-                    # Reconstruction loss (SAME)
-                    recon_loss = F.mse_loss(reconstructed, x_clean)
-                    reconstruction_losses.append(recon_loss)
+                    # Compute reconstruction loss against clean target
+                    # CRITICAL: Make sure both tensors are valid
+                    if torch.isnan(x_clean).any():
+                        print(f"      Warning: NaN in x_clean target")
+                        # Replace NaN in target with reconstructed values (no loss contribution)
+                        x_clean_safe = torch.where(torch.isnan(x_clean), reconstructed.detach(), x_clean)
+                    else:
+                        x_clean_safe = x_clean
+
+                    # Compute MSE loss
+                    recon_loss = F.mse_loss(reconstructed, x_clean_safe)
+
+                    # Final check
+                    if torch.isnan(recon_loss) or torch.isinf(recon_loss):
+                        print(f"      Warning: Invalid loss for mask {k}: {recon_loss}")
+                        reconstruction_losses.append(torch.tensor(0.0, device=device))
+                    else:
+                        reconstruction_losses.append(recon_loss)
 
                 except Exception as e:
-                    print(f"Error processing frequency mask {k}: {e}")
+                    print(f"      Error processing frequency mask {k}: {e}")
                     reconstruction_losses.append(torch.tensor(0.0, device=device))
 
             # Aggregate losses
             if reconstruction_losses:
-                avg_reconstruction_loss = torch.stack(reconstruction_losses).mean()
+                # Filter out zero losses if we have some valid ones
+                valid_losses = [loss for loss in reconstruction_losses if loss.item() > 0]
+                
+                if valid_losses:
+                    avg_reconstruction_loss = torch.stack(valid_losses).mean()
+                else:
+                    # All losses were zero/invalid
+                    avg_reconstruction_loss = torch.stack(reconstruction_losses).mean()
             else:
                 avg_reconstruction_loss = torch.tensor(0.0, device=device)
 
-            # CHANGED: No register loss
+            # No register loss for this version
             avg_register_loss = torch.tensor(0.0, device=device)
 
+            # Return 4 values (to match expected signature)
             return None, None, avg_register_loss, avg_reconstruction_loss
 
         except Exception as e:
-            print(f"Error in no-register frequency pre-training: {e}")
+            print(f"      Critical error in frequency pre-training: {e}")
+            import traceback
+            traceback.print_exc()
             return (
                 None,
                 None,

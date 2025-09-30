@@ -66,10 +66,12 @@ class ImputationDataset(Dataset):
         self.missing_rate = missing_rate
         self.missing_pattern = missing_pattern
 
+        # FIXED: Properly use shared_scaler
         if shared_scaler is not None:
             self.scaler = shared_scaler
-            print(f"    Using shared normalization scaler")
+            print(f"    ✓ Using shared normalization scaler (NOT creating new one)")
         else:
+            print(f"    ⚠️ No shared scaler provided, creating new one")
             self._setup_normalization()
 
     def __len__(self):
@@ -77,7 +79,7 @@ class ImputationDataset(Dataset):
 
     def _setup_normalization(self):
         """Setup normalization statistics from the dataset"""
-        from sklearn.preprocessing import StandardScaler
+        from sklearn.preprocessing import MinMaxScaler
 
         print(f"  Computing normalization statistics...")
         all_data = []
@@ -95,11 +97,12 @@ class ImputationDataset(Dataset):
         original_shape = data_array.shape
         data_flat = data_array.reshape(-1, data_array.shape[-1])  # [N*L, C]
 
-        # Fit scaler
-        self.scaler = StandardScaler()
+        # Use MinMaxScaler (scales to [0, 1])
+        self.scaler = MinMaxScaler()
         self.scaler.fit(data_flat)
 
-        print(f"  Normalization fitted on {len(all_data)} samples")
+        print(f"  MinMaxScaler fitted on {len(all_data)} samples")
+        print(f"  Data will be normalized to [0, 1] range")
 
     def _normalize_data(self, data):
         """Normalize data using fitted scaler"""
@@ -114,12 +117,56 @@ class ImputationDataset(Dataset):
         data_flat = data.reshape(-1, data.shape[-1])
         data_denormalized = self.scaler.inverse_transform(data_flat)
         return data_denormalized.reshape(original_shape)
+    
+    def _interpolate_nans(self, tensor):
+        """
+        Interpolate NaN values in time series tensor using linear interpolation
+        Args:
+            tensor: [seq_len, features] tensor possibly containing NaNs
+        Returns:
+            tensor: Same shape with NaNs interpolated
+        """
+        if not torch.isnan(tensor).any():
+            return tensor
+        
+        tensor_clean = tensor.clone()
+        seq_len, n_features = tensor.shape
+        
+        for feat_idx in range(n_features):
+            feature_series = tensor[:, feat_idx]
+            
+            if torch.isnan(feature_series).any():
+                # Get valid (non-NaN) indices and values
+                valid_mask = ~torch.isnan(feature_series)
+                valid_indices = torch.where(valid_mask)[0]
+                valid_values = feature_series[valid_mask]
+                
+                if len(valid_indices) == 0:
+                    # If entire feature is NaN, fill with 0
+                    tensor_clean[:, feat_idx] = 0.0
+                elif len(valid_indices) == 1:
+                    # If only one valid value, fill all with that value
+                    tensor_clean[:, feat_idx] = valid_values[0]
+                else:
+                    # Linear interpolation for NaN positions
+                    all_indices = torch.arange(seq_len, dtype=torch.float32)
+                    
+                    # Use numpy for interpolation (more reliable)
+                    valid_idx_np = valid_indices.cpu().numpy()
+                    valid_val_np = valid_values.cpu().numpy()
+                    all_idx_np = all_indices.cpu().numpy()
+                    
+                    # Interpolate
+                    interpolated = np.interp(all_idx_np, valid_idx_np, valid_val_np)
+                    tensor_clean[:, feat_idx] = torch.from_numpy(interpolated).float()
+        
+        return tensor_clean
 
     def __getitem__(self, index):
         try:
             seq_x, seq_y, seq_x_mark, seq_y_mark = self.base_dataset[index]
 
-            # CRITICAL FIX: Ensure all tensors are float32
+            # Ensure float32 tensors
             seq_x = (
                 torch.FloatTensor(seq_x)
                 if not torch.is_tensor(seq_x)
@@ -136,26 +183,28 @@ class ImputationDataset(Dataset):
             seq_x_normalized = self._normalize_data(seq_x_np)
             seq_x = torch.FloatTensor(seq_x_normalized)
 
-            # Create missing mask
-            mask = create_missing_mask(seq_x, self.missing_rate, self.missing_pattern)
-            mask = mask.bool()  # Ensure boolean
+            # CRITICAL FIX: Clean NaN from target BEFORE creating mask
+            seq_x_clean = self._interpolate_nans(seq_x)
 
-            # Apply missing values
-            seq_x_missing = seq_x.clone().float()
+            # Create missing mask on CLEAN data
+            mask = create_missing_mask(seq_x_clean, self.missing_rate, self.missing_pattern)
+            mask = mask.bool()
+
+            # Apply missing values to create input
+            seq_x_missing = seq_x_clean.clone().float()
             seq_x_missing[~mask] = float("nan")
 
-            # CRITICAL FIX: Return all tensors with correct dtypes
             return (
-                seq_x_missing.float(),  # float32
-                seq_x_mark.float(),  # float32
-                mask.bool(),  # boolean
-                seq_x.float(),  # float32 (target)
+                seq_x_missing.float(),  # Input with synthetic missing values
+                seq_x_mark.float(),
+                mask.bool(),
+                seq_x_clean.float(),    # Target is now guaranteed NaN-free
             )
 
         except Exception as e:
             print(f"    Error in __getitem__({index}): {e}")
             # Safe fallback
-            seq_shape = (96, 7)  # Default shape
+            seq_shape = (96, 7)
             seq_x = torch.zeros(seq_shape, dtype=torch.float32)
             seq_x_mark = torch.zeros((seq_shape[0], 4), dtype=torch.float32)
             mask = torch.ones(seq_shape, dtype=torch.bool)

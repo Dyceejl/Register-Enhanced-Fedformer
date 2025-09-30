@@ -65,7 +65,7 @@ class ImputationConfig:
         self.num_workers = 0
 
         # Early stopping and checkpointing
-        self.patience = 8
+        self.patience = 10
         self.save_best = True
         self.save_frequency = 5  # Save checkpoint every N epochs
 
@@ -178,13 +178,18 @@ class LightImputationConfig(ImputationConfig):
         # Fewer frequency masks
         self.Kf = 2
 
+        self.use_fft_interpolation = True  # Use linear interp in FFT
+         
         # EXTENDED TRAINING FOR COMPREHENSIVE STUDY
         self.train_epochs = 10
-        self.pretrain_epochs = 0
-        self.finetune_epochs = 10
+        self.pretrain_epochs = 4
+        self.finetune_epochs = 6
 
         # Override the automatic phase setup
-        self.two_phase_training = False
+        self.two_phase_training = True
+        
+        self.max_batches_per_domain = 100
+        self.max_eval_batches_per_domain = 50
 
         # Verify the math
         assert self.pretrain_epochs + self.finetune_epochs == self.train_epochs, (

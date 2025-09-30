@@ -52,7 +52,10 @@ class BRITSWrapper:
     def __init__(self, configs):
         self.configs = configs
         self.model = None
-        self.scaler = StandardScaler()
+        
+        from sklearn.preprocessing import MinMaxScaler  
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
+        
         self.fitted = False
         self.fixed_dim = getattr(configs, "fixed_input_dim", None)
         self.input_adapters = {}
@@ -332,7 +335,10 @@ class SAITSWrapper:
     def __init__(self, configs):
         self.configs = configs
         self.model = None
-        self.scaler = StandardScaler()
+        
+        from sklearn.preprocessing import MinMaxScaler  
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
+                                   
         self.fitted = False
         self.fixed_dim = getattr(configs, "fixed_input_dim", None)
         self.input_adapters = {}

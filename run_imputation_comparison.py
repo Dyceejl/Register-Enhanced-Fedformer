@@ -20,7 +20,6 @@ import time
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Clean imports - only what we need
-from Register_Analysis import analyze_register_system
 from configs.imputation_config import ImputationConfig, LightImputationConfig
 from imputation_trainer import (
     ImputationDataset,
@@ -145,7 +144,7 @@ class NoRegisterTrainer:
         epoch_losses = []
         epoch_metrics = {
             "reconstruction_loss": [],
-            "register_loss": [],  # Will always be 0
+            "register_loss": [],
             "total_loss": [],
         }
 
@@ -166,6 +165,10 @@ class NoRegisterTrainer:
                     num_workers=self.configs.num_workers,
                     drop_last=True,
                 )
+                
+                num_batches = len(domain_loader)
+                print(f"    {domain_name}: {num_batches} batches available")
+            
             except Exception as e:
                 print(f"    Error creating dataset for {domain_name}: {e}")
                 continue
@@ -173,37 +176,80 @@ class NoRegisterTrainer:
             domain_losses = []
             domain_recon_losses = []
             processed_batches = 0
+            skipped_batches = 0  # ADD THIS
 
             for batch_idx, batch_data in enumerate(domain_loader):
+                # ADD: Print every 10th batch
+                if batch_idx % 10 == 0:
+                    print(f"      Processing batch {batch_idx}/{num_batches}...")
+                
                 try:
-                    x_missing, x_mark, mask, x_target = batch_data
+                    # Handle variable number of return values
+                    if len(batch_data) == 4:
+                        x_missing, x_mark, mask, x_target = batch_data
+                    elif len(batch_data) == 3:
+                        x_missing, x_mark, mask = batch_data
+                        x_target = x_missing.clone()
+                    else:
+                        skipped_batches += 1
+                        continue
 
                     x_missing = x_missing.to(device)
                     x_mark = x_mark.to(device)
                     mask = mask.to(device)
                     x_target = x_target.to(device)
 
+                    if batch_idx == 0:
+                        print(f"      [BATCH 0 DEBUG]")
+                        print(f"        x_missing shape: {x_missing.shape}")
+                        print(f"        x_missing has NaN: {torch.isnan(x_missing).any()}")
+                        print(f"        x_missing all NaN: {torch.isnan(x_missing).all()}")
+                        print(f"        mask shape: {mask.shape}")
+                        print(f"        mask sum: {mask.sum().item()}")
+                        print(f"        mask all True: {mask.all().item()}")
+                        print(f"        Attempting forward pass...")
+
+                    # This check might be too strict
                     if torch.isnan(x_missing).all() or mask.sum() == 0:
+                        if batch_idx == 0:
+                            print(f"        ❌ SKIPPED: all NaN or mask.sum() == 0")
+                        skipped_batches += 1
                         continue
 
                     self.main_optimizer.zero_grad()
 
                     # Forward pass (no register loss returned)
-                    _, _, register_loss, reconstruction_loss = self.model(
-                        x_missing,
-                        x_mark,
-                        mask,
-                        domain_name,
-                        training_phase="frequency_pretrain",
-                    )
-
-                    if torch.isnan(reconstruction_loss):
+                    try:
+                        _, _, register_loss, reconstruction_loss = self.model(
+                            x_missing,
+                            x_mark,
+                            mask,
+                            domain_name,
+                            training_phase="frequency_pretrain",
+                        )
+                        
+                        if batch_idx == 0:
+                            print(f"        ✓ Forward pass succeeded")
+                            print(f"        reconstruction_loss: {reconstruction_loss.item()}")
+                        
+                    except Exception as forward_error:
+                        print(f"      ❌ Forward pass error in batch {batch_idx}: {forward_error}")
+                        if batch_idx == 0:
+                            import traceback
+                            traceback.print_exc()
+                        skipped_batches += 1
                         continue
 
-                    # Only reconstruction loss (no register component)
+                    if torch.isnan(reconstruction_loss):
+                        if batch_idx == 0:
+                            print(f"        ❌ SKIPPED: reconstruction_loss is NaN")
+                        skipped_batches += 1
+                        continue
+
                     total_loss = self.reconstruction_weight * reconstruction_loss
 
                     if torch.isnan(total_loss) or torch.isinf(total_loss):
+                        skipped_batches += 1
                         continue
 
                     total_loss.backward()
@@ -218,25 +264,32 @@ class NoRegisterTrainer:
 
                 except Exception as e:
                     print(f"    Error in {domain_name} batch {batch_idx}: {e}")
+                    if batch_idx == 0:
+                        import traceback
+                        traceback.print_exc()
+                    skipped_batches += 1
                     continue
 
                 if batch_idx >= getattr(self.configs, "max_batches_per_domain", 1000):
                     break
 
+            # ADD: Report skipped batches
+            print(f"    {domain_name}: Processed={processed_batches}, Skipped={skipped_batches}")
+            
             if domain_losses:
                 avg_domain_loss = sum(domain_losses) / len(domain_losses)
                 avg_recon_loss = sum(domain_recon_losses) / len(domain_recon_losses)
 
                 epoch_losses.append(avg_domain_loss)
                 epoch_metrics["reconstruction_loss"].append(avg_recon_loss)
-                epoch_metrics["register_loss"].append(0.0)  # Always 0
+                epoch_metrics["register_loss"].append(0.0)
                 epoch_metrics["total_loss"].append(avg_domain_loss)
 
                 print(
                     f"    {domain_name:12s}: Loss={avg_domain_loss:.6f}, Batches={processed_batches}"
                 )
             else:
-                print(f"    {domain_name:12s}: No valid batches processed")
+                print(f"    {domain_name:12s}: ❌ No valid batches processed (all {skipped_batches} skipped)")
 
         if epoch_losses:
             return sum(epoch_losses) / len(epoch_losses), epoch_metrics
@@ -249,7 +302,7 @@ class NoRegisterTrainer:
         epoch_losses = []
         epoch_metrics = {
             "imputation_loss": [],
-            "register_loss": [],  # Will always be 0
+            "register_loss": [],
             "mae_loss": [],
             "total_loss": [],
         }
@@ -282,19 +335,34 @@ class NoRegisterTrainer:
 
             for batch_idx, batch_data in enumerate(domain_loader):
                 try:
-                    x_missing, x_mark, mask, x_target = batch_data
+                    # FIXED: Handle variable number of return values
+                    if len(batch_data) == 4:
+                        x_missing, x_mark, mask, x_target = batch_data
+                    elif len(batch_data) == 3:
+                        x_missing, x_mark, mask = batch_data
+                        x_target = x_missing.clone()
+                    else:
+                        continue
 
                     x_missing = x_missing.to(device)
                     x_mark = x_mark.to(device)
                     mask = mask.to(device)
                     x_target = x_target.to(device)
-
+                    
+                    if batch_idx == 0 and processed_batches == 0:
+                        print(f"    [DEBUG] {domain_name} Phase 2 batch 0:")
+                        print(f"      x_missing: shape={x_missing.shape}, has_nan={torch.isnan(x_missing).any()}, all_nan={torch.isnan(x_missing).all()}")
+                        print(f"      mask: shape={mask.shape}, sum={mask.sum()}")
+                        print(f"      x_target: shape={x_target.shape}, has_nan={torch.isnan(x_target).any()}, all_nan={torch.isnan(x_target).all()}")  # ADD all_nan check
+                        print(f"      x_target NaN count: {torch.isnan(x_target).sum()}/{x_target.numel()}")  # ADD this line
+            
                     if torch.isnan(x_missing).all() or mask.sum() == 0:
+                        print(f"    [SKIP] Batch {batch_idx}: all NaN or no mask")  # ADD THIS
                         continue
+
 
                     self.main_optimizer.zero_grad()
 
-                    # Forward pass (no register loss)
                     dec_out, reconstructed, register_loss = self.model(
                         x_missing,
                         x_mark,
@@ -302,8 +370,11 @@ class NoRegisterTrainer:
                         domain_name,
                         training_phase="imputation_finetune",
                     )
+                    
+                    if batch_idx == 0 and processed_batches == 0:
+                        print(f"      dec_out: shape={dec_out.shape}, has_nan={torch.isnan(dec_out).any()}, all_nan={torch.isnan(dec_out).all()}")
+                        print(f"      reconstructed: has_nan={torch.isnan(reconstructed).any()}")
 
-                    # Imputation loss only on missing values
                     missing_mask = (~mask).bool()
                     if missing_mask.any():
                         imputation_loss = self.criterion(
@@ -319,7 +390,6 @@ class NoRegisterTrainer:
                     if torch.isnan(imputation_loss) or torch.isnan(mae_loss):
                         continue
 
-                    # Only imputation loss (no register component)
                     total_loss = self.imputation_weight * imputation_loss
 
                     if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -353,7 +423,7 @@ class NoRegisterTrainer:
                 epoch_losses.append(avg_domain_loss)
                 epoch_metrics["imputation_loss"].append(avg_imputation_loss)
                 epoch_metrics["mae_loss"].append(avg_mae_loss)
-                epoch_metrics["register_loss"].append(0.0)  # Always 0
+                epoch_metrics["register_loss"].append(0.0)
                 epoch_metrics["total_loss"].append(avg_domain_loss)
 
                 print(
@@ -400,7 +470,14 @@ class NoRegisterTrainer:
 
                 for batch_idx, batch_data in enumerate(test_loader):
                     try:
-                        x_missing, x_mark, mask, x_target = batch_data
+                        # FIXED: Handle variable number of return values
+                        if len(batch_data) == 4:
+                            x_missing, x_mark, mask, x_target = batch_data
+                        elif len(batch_data) == 3:
+                            x_missing, x_mark, mask = batch_data
+                            x_target = x_missing.clone()
+                        else:
+                            continue
 
                         x_missing = x_missing.to(device)
                         x_mark = x_mark.to(device)
@@ -2094,143 +2171,139 @@ def run_complete_debugging_suite(base_config):
     }
 
 
-def train_competitive_fedformer(configs):
+def train_competitive_fedformer(configs, train_datasets=None, test_datasets=None):
     """
-    Train FedFormer with all fixes applied for competitive performance - FIXED VERSION
+    Train FedFormer with FFT-based frequency learning (with linear interpolation)
     """
     print("\n" + "=" * 80)
-    print("TRAINING COMPETITIVE FEDFORMER (ALL FIXES APPLIED)")
+    print("TRAINING FEDFORMER WITH FFT + LINEAR INTERPOLATION")
     print("=" * 80)
 
-    # Create datasets with normalization
-    train_datasets, test_datasets = create_domain_datasets(configs)
+    # Create datasets ONLY if not provided
+    if train_datasets is None or test_datasets is None:
+        train_datasets, test_datasets = create_domain_datasets(configs)
+        print(f"Created datasets for {len(train_datasets)} domains")
+    else:
+        print(f"Using provided datasets for {len(train_datasets)} domains")  # ← Changed message
 
-    print(f"Training on {len(train_datasets)} domains with normalization")
+    print(f"Training on {len(train_datasets)} domains")
 
-    # CRITICAL FIX: Create shared scalers for each domain to avoid recomputation
+    # Create shared scalers
     print("Setting up shared normalization scalers...")
     domain_scalers = {}
-
     for domain_name, train_dataset in train_datasets.items():
-        print(f"  Creating scaler for {domain_name}...")
         try:
-            # Create one ImputationDataset to compute scaler
             temp_dataset = ImputationDataset(train_dataset, missing_rate=0.2)
             domain_scalers[domain_name] = temp_dataset.scaler
             print(f"    ✓ Scaler created for {domain_name}")
         except Exception as e:
             print(f"    ✗ Error creating scaler for {domain_name}: {e}")
-            # Create identity scaler as fallback
             from sklearn.preprocessing import StandardScaler
-
             fallback_scaler = StandardScaler()
-            dummy_data = np.zeros((10, 7))  # Assume 7 features as fallback
+            dummy_data = np.zeros((10, 7))
             fallback_scaler.fit(dummy_data)
-            fallback_scaler.mean_ = np.zeros_like(fallback_scaler.mean_)
-            fallback_scaler.scale_ = np.ones_like(fallback_scaler.scale_)
             domain_scalers[domain_name] = fallback_scaler
 
-    # Use the optimized architecture
-    try:
-        model = ImputationOptimizedFEDformer(configs)
-        print(f"Using ImputationOptimizedFEDformer architecture")
-    except Exception as e:
-        print(f"ImputationOptimizedFEDformer failed: {e}")
-        print("Falling back to MultiDomainFEDformerWithoutRegister")
-        from multi_domain_fedformer import MultiDomainFEDformerWithoutRegister
+    # CHANGED: Use model with FFT capability
+    from multi_domain_fedformer import MultiDomainFEDformerWithoutRegister
+    
+    # Set config for linear interpolation in FFT
+    configs.use_fft_interpolation = getattr(configs, 'use_fft_interpolation', True)
+    
+    model = MultiDomainFEDformerWithoutRegister(configs)
+    print(f"Using MultiDomainFEDformerWithoutRegister with FFT")
+    print(f"  FFT Linear Interpolation: {configs.use_fft_interpolation}")
 
-        model = MultiDomainFEDformerWithoutRegister(configs)
+    # CHANGED: Use NoRegisterTrainer (does two-phase training with frequency pretraining)
+    trainer = NoRegisterTrainer(model, configs)
+    print(f"Using NoRegisterTrainer (frequency pretraining + imputation finetuning)")
 
-    # Use the focused trainer
-    try:
-        trainer = ImputationFocusedTrainer(model, configs)
-        print(f"Using ImputationFocusedTrainer (direct imputation training)")
-    except Exception as e:
-        print(f"ImputationFocusedTrainer creation failed: {e}")
-        return None, [], {}
+    # Configure two-phase training
+    if not hasattr(configs, 'two_phase_training') or not configs.two_phase_training:
+        # Force two-phase for FFT
+        configs.two_phase_training = True
+        configs.pretrain_epochs = max(1, configs.train_epochs // 2)
+        configs.finetune_epochs = configs.train_epochs - configs.pretrain_epochs
+        print(f"  Enabled two-phase training: {configs.pretrain_epochs} pretrain + {configs.finetune_epochs} finetune")
 
-    # Training loop
     best_loss = float("inf")
     train_losses = []
 
-    print(f"\nTraining for {configs.train_epochs} epochs (imputation only):")
+    # Phase 1: Frequency pretraining
+    if configs.pretrain_epochs > 0:
+        print(f"\nPhase 1: Frequency Pretraining ({configs.pretrain_epochs} epochs)")
+        for epoch in range(configs.pretrain_epochs):
+            epoch_train_datasets = {}
+            for domain_name, train_dataset in train_datasets.items():
+                try:
+                    epoch_train_datasets[domain_name] = ImputationDataset(
+                        train_dataset,
+                        missing_rate=configs.missing_rate,
+                        shared_scaler=domain_scalers[domain_name],
+                    )
+                except Exception as e:
+                    print(f"  Error creating dataset for {domain_name}: {e}")
+                    continue
 
-    for epoch in range(configs.train_epochs):
-        epoch_start_time = time.time()
-
-        print(f"\nEpoch {epoch + 1:2d}:")
-
-        # CRITICAL FIX: Create datasets with shared scalers for this epoch
-        epoch_train_datasets = {}
-        for domain_name, train_dataset in train_datasets.items():
-            try:
-                epoch_train_datasets[domain_name] = ImputationDataset(
-                    train_dataset,
-                    missing_rate=configs.missing_rate,
-                    shared_scaler=domain_scalers[domain_name],  # Use shared scaler
-                )
-            except Exception as e:
-                print(f"  Error creating epoch dataset for {domain_name}: {e}")
+            if not epoch_train_datasets:
                 continue
 
-        if not epoch_train_datasets:
-            print("  No valid datasets for this epoch, skipping...")
-            train_losses.append(float("inf"))
-            continue
-
-        # Train epoch - direct imputation training
-        try:
-            epoch_loss = trainer.train_epoch_imputation_only(epoch_train_datasets)
-        except Exception as e:
-            print(f"  Training failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            epoch_loss = float("inf")
-
-        train_losses.append(epoch_loss)
-        epoch_time = time.time() - epoch_start_time
-
-        print(f"  Loss={epoch_loss:.6f}, Time={epoch_time:.1f}s")
-
-        # Check for valid loss
-        if (
-            not (np.isnan(epoch_loss) or np.isinf(epoch_loss))
-            and epoch_loss < best_loss
-        ):
-            best_loss = epoch_loss
-            # Save best model
             try:
-                os.makedirs(configs.save_path, exist_ok=True)
-                torch.save(
-                    model.state_dict(),
-                    os.path.join(configs.save_path, "competitive_fedformer_best.pth"),
-                )
-                print(f"    → New best model saved! (Loss: {best_loss:.6f})")
+                epoch_loss, _ = trainer.train_epoch_frequency_pretrain(epoch_train_datasets)
+                train_losses.append(epoch_loss)
+                
+                if epoch_loss < best_loss and epoch_loss > 0:
+                    best_loss = epoch_loss
+                    print(f"  Epoch {epoch + 1}: Loss={epoch_loss:.6f} (new best)")
+                else:
+                    print(f"  Epoch {epoch + 1}: Loss={epoch_loss:.6f}")
+                    
             except Exception as e:
-                print(f"    Warning: Could not save model: {e}")
+                print(f"  Pretraining epoch {epoch + 1} failed: {e}")
+                continue
 
-        # Early stopping for diverged training
-        if epoch > 2 and (np.isinf(epoch_loss) or epoch_loss > best_loss * 3.0):
-            print(
-                f"  Early stopping at epoch {epoch + 1} (loss diverging: {epoch_loss:.6f})"
-            )
-            break
+    # Phase 2: Imputation finetuning
+    if configs.finetune_epochs > 0:
+        print(f"\nPhase 2: Imputation Finetuning ({configs.finetune_epochs} epochs)")
+        for epoch in range(configs.finetune_epochs):
+            epoch_train_datasets = {}
+            for domain_name, train_dataset in train_datasets.items():
+                try:
+                    epoch_train_datasets[domain_name] = ImputationDataset(
+                        train_dataset,
+                        missing_rate=configs.missing_rate,
+                        shared_scaler=domain_scalers[domain_name],
+                    )
+                except Exception as e:
+                    continue
 
-    # Evaluation with shared scalers
-    print(f"\nEvaluating competitive FedFormer...")
+            if not epoch_train_datasets:
+                continue
 
+            try:
+                epoch_loss, _ = trainer.train_epoch_imputation_finetune(epoch_train_datasets)
+                train_losses.append(epoch_loss)
+                
+                if epoch_loss < best_loss and epoch_loss > 0:
+                    best_loss = epoch_loss
+                    print(f"  Epoch {epoch + 1}: Loss={epoch_loss:.6f} (new best)")
+                else:
+                    print(f"  Epoch {epoch + 1}: Loss={epoch_loss:.6f}")
+                    
+            except Exception as e:
+                print(f"  Finetuning epoch {epoch + 1} failed: {e}")
+                continue
+
+    # Evaluation
+    print(f"\nEvaluating FedFormer with FFT...")
     try:
-        # Create test datasets with shared scalers
         epoch_test_datasets = {}
         for domain_name, test_dataset in test_datasets.items():
             try:
                 epoch_test_datasets[domain_name] = ImputationDataset(
                     test_dataset,
                     missing_rate=configs.test_missing_rate,
-                    shared_scaler=domain_scalers[
-                        domain_name
-                    ],  # Use same scaler as training
+                    shared_scaler=domain_scalers[domain_name],
                 )
             except Exception as e:
                 print(f"  Error creating test dataset for {domain_name}: {e}")
@@ -2239,42 +2312,24 @@ def train_competitive_fedformer(configs):
         if epoch_test_datasets:
             test_results = trainer.evaluate_domain_separate(epoch_test_datasets)
         else:
-            print("  No valid test datasets, evaluation failed")
             test_results = {}
 
     except Exception as e:
         print(f"  Evaluation failed: {e}")
-        import traceback
-
-        traceback.print_exc()
         test_results = {}
 
     # Print results
-    print(f"\nCompetitive FedFormer Results:")
+    print(f"\nFedFormer (FFT + Linear Interp) Results:")
     print(f"{'Domain':<12} {'MSE':<12} {'MAE':<12}")
     print("-" * 40)
-
-    total_mse, total_mae = 0, 0
-    valid_domains = 0
 
     for domain_name in train_datasets.keys():
         if domain_name in test_results:
             mse, mae = test_results[domain_name]
-            if mse != float("inf"):
+            if mse != float('inf'):
                 print(f"{domain_name:<12} {mse:<12.6f} {mae:<12.6f}")
-                total_mse += mse
-                total_mae += mae
-                valid_domains += 1
             else:
                 print(f"{domain_name:<12} {'Failed':<12} {'Failed':<12}")
-        else:
-            print(f"{domain_name:<12} {'Missing':<12} {'Missing':<12}")
-
-    if valid_domains > 0:
-        avg_mse = total_mse / valid_domains
-        avg_mae = total_mae / valid_domains
-        print("-" * 40)
-        print(f"{'AVERAGE':<12} {avg_mse:<12.6f} {avg_mae:<12.6f}")
 
     print(f"\nBest training loss: {best_loss:.6f}")
     print("=" * 80)
@@ -2300,9 +2355,48 @@ def run_fixed_comparison():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     configs.save_path = os.path.join(configs.save_path, f"complete_fixed_{timestamp}")
 
-    # Get datasets once
-    train_datasets, test_datasets = create_domain_datasets(configs)
-    print(f"✓ Datasets loaded: {list(train_datasets.keys())}")
+    print("\nLoading datasets...")
+    # Get ALL datasets
+    all_train_datasets, all_test_datasets = create_domain_datasets(configs, dataset_type="all")
+    
+    # SPECIFY YOUR DESIRED DOMAINS HERE
+    desired_domains = [
+        "ETTh1",
+        "ETTh2", 
+        "ETTm1",
+        "ETTm2",
+        "beijing_pm25",      # Beijing PM2.5
+        "air_quality",       # Air Quality
+        "bike_sharing",      # Bike Sharing
+        "weather",           # Weather
+        "appliances_energy"  # Appliances Energy
+    ]
+    
+    # Filter to only desired domains - AT FUNCTION LEVEL
+    train_datasets = {k: v for k, v in all_train_datasets.items() if k in desired_domains}
+    test_datasets = {k: v for k, v in all_test_datasets.items() if k in desired_domains}
+    
+    print(f"✓ Selected {len(train_datasets)} domains for comparison:")
+    for domain_name in desired_domains:
+        if domain_name in train_datasets:
+            sample = train_datasets[domain_name][0]
+            print(f"  ✓ {domain_name:20s}: {sample[0].shape} - {len(train_datasets[domain_name])} samples")
+        else:
+            print(f"  ✗ {domain_name:20s}: NOT FOUND")
+    
+    # Verify all desired domains were loaded
+    missing_domains = set(desired_domains) - set(train_datasets.keys())
+    if missing_domains:
+        print(f"\n⚠️  WARNING: Missing domains: {missing_domains}")
+        print("These domains were not found in the dataset. Check dataset_type='all' configuration.")
+    
+    # Check if we have any valid domains
+    if not train_datasets:
+        print("❌ ERROR: No valid datasets found! Cannot proceed.")
+        return {}, {}, {}
+    
+    print()
+    
 
     # 1. Train FedFormer (multi-domain)
     print("\n" + "=" * 60)
@@ -2310,7 +2404,7 @@ def run_fixed_comparison():
     print("=" * 60)
 
     try:
-        model_fixed, losses_fixed, results_fixed = train_competitive_fedformer(configs)
+        model_fixed, losses_fixed, results_fixed = train_competitive_fedformer(configs,  train_datasets=train_datasets, test_datasets=test_datasets)
         print("✅ FedFormer training completed!")
 
         # Show FedFormer results
